@@ -1,0 +1,637 @@
+name: Build shuffle patch
+on: workflow_dispatch
+permissions:
+  contents: read
+  packages: read
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Get HushPinterest (pinned commit)
+        shell: bash
+        run: |
+          git config --global core.autocrlf false
+          git init -q hp
+          cd hp
+          git fetch -q --depth 1 https://github.com/SysAdminDoc/HushPinterest d93cd0a8cc74ece3ff6e461c0c45e15e0296a7f4
+          git checkout -q FETCH_HEAD
+
+      - name: Add Shuffle board
+        shell: bash
+        working-directory: hp
+        run: |
+          EXT=extensions/pinterest/src/main/java/app/hushpinterest/extension/pinterest
+          cat > $EXT/actions/ShuffleBoard.java <<'JAVA_END'
+          /*
+           * Shuffle board, an unofficial local addition to HushPinterest.
+           * SPDX-License-Identifier: GPL-3.0-only
+           */
+          package app.hushpinterest.extension.pinterest.actions;
+
+          import android.app.Activity;
+          import android.app.AlertDialog;
+          import android.app.Dialog;
+          import android.content.Intent;
+          import android.graphics.Bitmap;
+          import android.graphics.BitmapFactory;
+          import android.graphics.Rect;
+          import android.net.Uri;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.os.SystemClock;
+          import android.util.LruCache;
+          import android.view.View;
+          import android.view.ViewGroup;
+          import android.view.Window;
+          import android.view.WindowManager;
+          import android.widget.AbsListView;
+          import android.widget.BaseAdapter;
+          import android.widget.Button;
+          import android.widget.GridView;
+          import android.widget.ImageView;
+          import android.widget.LinearLayout;
+          import android.widget.TextView;
+
+          import java.io.ByteArrayOutputStream;
+          import java.io.IOException;
+          import java.io.InputStream;
+          import java.lang.ref.WeakReference;
+          import java.net.HttpURLConnection;
+          import java.net.URL;
+          import java.util.ArrayList;
+          import java.util.Collections;
+          import java.util.HashMap;
+          import java.util.LinkedHashMap;
+          import java.util.List;
+          import java.util.Map;
+          import java.util.Random;
+          import java.util.concurrent.LinkedBlockingDeque;
+          import java.util.concurrent.ThreadPoolExecutor;
+          import java.util.concurrent.TimeUnit;
+
+          import app.hushpinterest.extension.shared.Utils;
+
+          /**
+           * A "Shuffle all pins" row in a board's menu. It scrolls the board until every pin has loaded,
+           * then shows all of them in a new random order. The saved board order is never changed.
+           */
+          public final class ShuffleBoard {
+              private ShuffleBoard() {}
+
+              private static final int BOARDS = 8;
+              private static final int PINS = 20000;
+              private static final long TICK_MS = 200;
+              /** At the bottom of the board with nothing new for this long: the board is loaded. */
+              private static final long END_IDLE_MS = 8000;
+              /** Still scrolling with nothing new for this long: only other content is left below. */
+              private static final long STALL_MS = 45000;
+              private static final Random RANDOM = new Random();
+
+              private static final class Pin {
+                  final String id;
+                  final String thumb;
+                  final String large;
+
+                  Pin(String id, String thumb, String large) {
+                      this.id = id;
+                      this.thumb = thumb;
+                      this.large = large;
+                  }
+              }
+
+              private static final LinkedHashMap<String, LinkedHashMap<String, Pin>> LOADED =
+                      new LinkedHashMap<String, LinkedHashMap<String, Pin>>(16, 0.75f, true) {
+                          @Override
+                          protected boolean removeEldestEntry(Map.Entry<String, LinkedHashMap<String, Pin>> eldest) {
+                              return size() > BOARDS;
+                          }
+                      };
+
+              /** The board being loaded for a shuffle, or null. */
+              private static volatile String loading;
+
+              // The patch writes the bodies of these stubs.
+              private static List<?> menuItems(Object menu) { return null; }
+              private static Object menuHandler(Object menu) { return null; }
+              private static Object menuCopy(Object menu, List<?> items, Object handler) { return null; }
+              private static Object menuRow(int title, int index, String text) { return null; }
+              private static int titleResource() { return 0; }
+              private static String boardId(Object screen) { return null; }
+              private static void dismissMenu(Object screen) {}
+
+              /** Remembers the pins of any list that is nearly all one board, or belongs to the board being loaded. */
+              public static void record(List<?> items) {
+                  try {
+                      if (items == null || items.isEmpty()) return;
+                      Map<String, List<Object>> found = new HashMap<>();
+                      int pins = 0;
+                      for (Object item : items) {
+                          String board = PinMedia.id(item) == null ? null : BoardDownloads.boardOf(item);
+                          if (board == null) continue;
+                          pins++;
+                          List<Object> models = found.get(board);
+                          if (models == null) found.put(board, models = new ArrayList<>());
+                          models.add(item);
+                      }
+                      String target = loading;
+                      for (Map.Entry<String, List<Object>> entry : found.entrySet()) {
+                          if (!entry.getKey().equals(target) && entry.getValue().size() * 10 < pins * 9) continue;
+                          synchronized (LOADED) {
+                              LinkedHashMap<String, Pin> board = LOADED.get(entry.getKey());
+                              if (board == null) LOADED.put(entry.getKey(), board = new LinkedHashMap<>());
+                              for (Object model : entry.getValue()) {
+                                  String id = PinMedia.id(model);
+                                  Pin old = board.get(id);
+                                  if (old == null ? board.size() < PINS : old.thumb == null) board.put(id, pin(id, model));
+                              }
+                          }
+                      }
+                  } catch (Throwable ignored) {
+                      // Never disturb the feed.
+                  }
+              }
+
+              /** Keeps only the id and two picture addresses of a pin. */
+              private static Pin pin(String id, Object model) {
+                  String thumb = null;
+                  String large = null;
+                  int thumbScore = Integer.MAX_VALUE;
+                  int largest = -1;
+                  Object images = PinMedia.field(model, "images");
+                  if (images instanceof Map<?, ?>) {
+                      for (Map.Entry<?, ?> entry : ((Map<?, ?>) images).entrySet()) {
+                          Object url = PinMedia.field(entry.getValue(), "url");
+                          if (!(url instanceof String) || PinMedia.mediaUri((String) url) == null) continue;
+                          int width = width(String.valueOf(entry.getKey()));
+                          if (width > largest) {
+                              largest = width;
+                              large = (String) url;
+                          }
+                          // The smallest size at least 200 wide, otherwise the widest below that.
+                          int score = width >= 200 ? width : 100000 - width;
+                          if (score < thumbScore) {
+                              thumbScore = score;
+                              thumb = (String) url;
+                          }
+                      }
+                  }
+                  if (large == null) {
+                      PinMedia.Resolution media = PinMedia.resolve(model);
+                      if (media != null && media.source != null && media.source.mime.startsWith("image/")) {
+                          thumb = large = media.source.url;
+                      }
+                  }
+                  return new Pin(id, thumb, large);
+              }
+
+              /** The width an images key names, such as 236x. Crops such as 150x150 rank last. */
+              private static int width(String key) {
+                  if (key.matches("[1-9][0-9]{0,4}x")) return Integer.parseInt(key.substring(0, key.length() - 1));
+                  return key.startsWith("orig") ? 10000 : 1;
+              }
+
+              private static int count(String board) {
+                  synchronized (LOADED) {
+                      Map<String, Pin> pins = LOADED.get(board);
+                      return pins == null ? 0 : pins.size();
+                  }
+              }
+
+              /** Called by the patched board screen. Returns the menu with one more row, or unchanged. */
+              public static Object menu(Object menu, Object screen) {
+                  try {
+                      if (menu == null) return null;
+                      String board = boardId(screen);
+                      List<?> items = menuItems(menu);
+                      Object handler = menuHandler(menu);
+                      int title = titleResource();
+                      if (board == null || items == null || items.isEmpty() || handler == null || title == 0) return menu;
+                      int index = items.size();
+                      Object row = menuRow(title, index, "Shuffle all pins");
+                      WeakReference<Object> owner = new WeakReference<>(screen);
+                      Object routed = BoardDownloads.route(handler, index, () -> start(owner.get(), board));
+                      if (row == null || routed == null) return menu;
+                      List<Object> rows = new ArrayList<>(items);
+                      rows.add(row);
+                      Object copy = menuCopy(menu, rows, routed);
+                      return copy == null ? menu : copy;
+                  } catch (Throwable failure) {
+                      return menu;
+                  }
+              }
+
+              private static void start(Object screen, String board) {
+                  try {
+                      if (screen != null) dismissMenu(screen);
+                  } catch (Throwable ignored) {
+                      // The shuffle still runs.
+                  }
+                  Activity activity = Utils.getActivity();
+                  if (activity == null) return;
+                  WeakReference<Activity> host = new WeakReference<>(activity);
+                  // Wait for the menu sheet to close, so it isn't mistaken for the board.
+                  new Handler(Looper.getMainLooper()).postDelayed(() -> {
+                      try {
+                          load(host.get(), board);
+                      } catch (Throwable failure) {
+                          loading = null;
+                          Utils.showToastLong("Couldn't shuffle this board.");
+                      }
+                  }, 700);
+              }
+
+              /** Scrolls the board down until no more of its pins arrive, then shows the shuffle. */
+              private static void load(Activity activity, String board) {
+                  if (activity == null || activity.isFinishing() || activity.isDestroyed()) return;
+                  Handler main = new Handler(Looper.getMainLooper());
+                  boolean[] done = {false};
+                  loading = board;
+                  AlertDialog progress = new AlertDialog.Builder(activity)
+                          .setTitle("Loading the whole board")
+                          .setMessage(count(board) + " pins loaded")
+                          .setPositiveButton("Shuffle now", (dialog, which) -> show(activity, board))
+                          .setNegativeButton("Cancel", null)
+                          .create();
+                  progress.setCanceledOnTouchOutside(false);
+                  progress.setOnDismissListener(dialog -> {
+                      done[0] = true;
+                      loading = null;
+                  });
+                  Runnable tick = new Runnable() {
+                      private View grid;
+                      private int last = count(board);
+                      private long changed = SystemClock.uptimeMillis();
+                      private int waits;
+
+                      @Override
+                      public void run() {
+                          if (done[0]) return;
+                          try {
+                              if (activity.isFinishing() || activity.isDestroyed()) {
+                                  done[0] = true;
+                                  loading = null;
+                                  return;
+                              }
+                              if (grid == null || !grid.isShown()) grid = scroller(activity.getWindow().getDecorView());
+                              int now = count(board);
+                              long time = SystemClock.uptimeMillis();
+                              if (now > last) {
+                                  last = now;
+                                  changed = time;
+                              }
+                              progress.setMessage(now + " pins loaded");
+                              boolean more = grid != null && grid.canScrollVertically(1);
+                              long idle = time - changed;
+                              if (idle >= STALL_MS || (!more && idle >= END_IDLE_MS)) {
+                                  progress.dismiss();
+                                  show(activity, board);
+                                  return;
+                              }
+                              if (more) {
+                                  grid.scrollBy(0, grid.getHeight());
+                              } else if (grid != null && ++waits % 10 == 0) {
+                                  // Step back so the next scroll asks Pinterest for the next page again.
+                                  grid.scrollBy(0, -grid.getHeight() / 2);
+                              }
+                              main.postDelayed(this, TICK_MS);
+                          } catch (Throwable failure) {
+                              progress.dismiss();
+                              Utils.showToastLong("Couldn't load this board.");
+                          }
+                      }
+                  };
+                  progress.show();
+                  Window window = progress.getWindow();
+                  if (window != null) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                  main.post(tick);
+              }
+
+              /** The topmost large view that scrolls up and down: the board's grid. */
+              private static View scroller(View root) {
+                  View[] best = {null};
+                  find(root, (long) root.getWidth() * root.getHeight() * 2 / 5, best);
+                  return best[0];
+              }
+
+              private static void find(View view, long wanted, View[] best) {
+                  if (view.getVisibility() != View.VISIBLE || view.getAlpha() == 0f) return;
+                  Rect seen = new Rect();
+                  if ((view.canScrollVertically(1) || view.canScrollVertically(-1)) && view.getGlobalVisibleRect(seen)
+                          && (long) seen.width() * seen.height() >= wanted) {
+                      best[0] = view;
+                  }
+                  if (view instanceof ViewGroup) {
+                      ViewGroup group = (ViewGroup) view;
+                      for (int i = 0; i < group.getChildCount(); i++) find(group.getChildAt(i), wanted, best);
+                  }
+              }
+
+              /** Every kept pin of the board, in a new random order, in a full-screen grid. */
+              private static void show(Activity activity, String board) {
+                  try {
+                      if (activity.isFinishing() || activity.isDestroyed()) return;
+                      List<Pin> pins = new ArrayList<>();
+                      synchronized (LOADED) {
+                          Map<String, Pin> kept = LOADED.get(board);
+                          if (kept != null) pins.addAll(kept.values());
+                      }
+                      if (pins.isEmpty()) {
+                          Utils.showToastLong("No pins found for this board. Pull to refresh it, then try again.");
+                          return;
+                      }
+                      Collections.shuffle(pins, RANDOM);
+                      Dialog dialog = new Dialog(activity, android.R.style.Theme_Material_NoActionBar);
+                      LinearLayout page = column(activity);
+                      LinearLayout bar = new LinearLayout(activity);
+                      TextView title = new TextView(activity);
+                      title.setText(pins.size() + " pins, shuffled");
+                      title.setTextColor(0xFFFFFFFF);
+                      title.setTextSize(18);
+                      title.setPadding(dp(activity, 12), dp(activity, 12), 0, dp(activity, 12));
+                      bar.addView(title, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+                      Button again = button(activity, "Shuffle");
+                      Button close = button(activity, "Close");
+                      bar.addView(again);
+                      bar.addView(close);
+
+                      GridView grid = new GridView(activity);
+                      grid.setNumColumns(3);
+                      grid.setHorizontalSpacing(dp(activity, 4));
+                      grid.setVerticalSpacing(dp(activity, 4));
+                      BaseAdapter adapter = new BaseAdapter() {
+                          @Override public int getCount() { return pins.size(); }
+                          @Override public Object getItem(int position) { return pins.get(position); }
+                          @Override public long getItemId(int position) { return position; }
+
+                          @Override
+                          public View getView(int position, View reused, ViewGroup parent) {
+                              ImageView cell = reused instanceof ImageView ? (ImageView) reused : new ImageView(activity);
+                              int across = parent.getWidth() > 0 ? parent.getWidth()
+                                      : activity.getResources().getDisplayMetrics().widthPixels;
+                              int width = Math.max(1, (across - dp(activity, 8)) / 3);
+                              cell.setLayoutParams(new AbsListView.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, width * 3 / 2));
+                              cell.setScaleType(ImageView.ScaleType.CENTER_CROP);
+                              cell.setBackgroundColor(0xFF333333);
+                              cell.setContentDescription("Pin " + (position + 1));
+                              picture(cell, pins.get(position).thumb, width);
+                              return cell;
+                          }
+                      };
+                      grid.setAdapter(adapter);
+                      grid.setOnItemClickListener((parent, view, position, id) -> preview(activity, dialog, pins.get(position)));
+                      again.setOnClickListener(view -> {
+                          Collections.shuffle(pins, RANDOM);
+                          adapter.notifyDataSetChanged();
+                          grid.setSelection(0);
+                      });
+                      close.setOnClickListener(view -> dialog.dismiss());
+
+                      page.addView(bar);
+                      page.addView(grid, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+                      fullScreen(dialog, page);
+                  } catch (Throwable failure) {
+                      Utils.showToastLong("Couldn't show the shuffled pins.");
+                  }
+              }
+
+              /** A larger picture of one pin. Back returns to the shuffled grid. */
+              private static void preview(Activity activity, Dialog grid, Pin pin) {
+                  Dialog dialog = new Dialog(activity, android.R.style.Theme_Material_NoActionBar);
+                  LinearLayout page = column(activity);
+                  ImageView image = new ImageView(activity);
+                  image.setScaleType(ImageView.ScaleType.FIT_CENTER);
+                  picture(image, pin.large, activity.getResources().getDisplayMetrics().widthPixels);
+                  Button open = button(activity, "Open pin");
+                  open.setOnClickListener(view -> {
+                      dialog.dismiss();
+                      grid.dismiss();
+                      try {
+                          Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse("https://www.pinterest.com/pin/" + pin.id + "/"));
+                          intent.setPackage(activity.getPackageName());
+                          activity.startActivity(intent);
+                      } catch (Throwable failure) {
+                          Utils.showToastLong("Couldn't open that pin.");
+                      }
+                  });
+                  page.addView(image, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+                  page.addView(open);
+                  fullScreen(dialog, page);
+              }
+
+              private static LinearLayout column(Activity activity) {
+                  LinearLayout page = new LinearLayout(activity);
+                  page.setOrientation(LinearLayout.VERTICAL);
+                  page.setBackgroundColor(0xFF111111);
+                  page.setFitsSystemWindows(true);
+                  return page;
+              }
+
+              private static Button button(Activity activity, String text) {
+                  Button button = new Button(activity);
+                  button.setText(text);
+                  return button;
+              }
+
+              private static void fullScreen(Dialog dialog, View content) {
+                  dialog.setContentView(content);
+                  dialog.show();
+                  Window window = dialog.getWindow();
+                  if (window != null) window.setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT);
+              }
+
+              private static int dp(Activity activity, int value) {
+                  return Math.round(value * activity.getResources().getDisplayMetrics().density);
+              }
+
+              /** Up to 32 MB of decoded pictures, counted in KB. */
+              private static final LruCache<String, Bitmap> CACHE = new LruCache<String, Bitmap>(32 * 1024) {
+                  @Override
+                  protected int sizeOf(String key, Bitmap value) {
+                      return value.getByteCount() / 1024;
+                  }
+              };
+
+              /** Newest requests run first, so what is on screen loads before what scrolled past. */
+              private static final ThreadPoolExecutor WORKERS = new ThreadPoolExecutor(4, 4, 30, TimeUnit.SECONDS,
+                      new LinkedBlockingDeque<Runnable>() {
+                          @Override
+                          public boolean offer(Runnable task) {
+                              return offerFirst(task);
+                          }
+                      });
+
+              private static void picture(ImageView view, String url, int width) {
+                  view.setTag(url);
+                  String key = width + " " + url;
+                  Bitmap cached = url == null ? null : CACHE.get(key);
+                  view.setImageBitmap(cached);
+                  if (url == null || cached != null) return;
+                  WORKERS.execute(() -> {
+                      if (!url.equals(view.getTag())) return;
+                      Bitmap bitmap = fetch(url, width);
+                      if (bitmap == null) return;
+                      CACHE.put(key, bitmap);
+                      view.post(() -> {
+                          if (url.equals(view.getTag())) view.setImageBitmap(bitmap);
+                      });
+                  });
+              }
+
+              private static Bitmap fetch(String url, int width) {
+                  HttpURLConnection connection = null;
+                  try {
+                      connection = (HttpURLConnection) new URL(url).openConnection();
+                      connection.setConnectTimeout(15000);
+                      connection.setReadTimeout(15000);
+                      if (connection.getResponseCode() != 200) return null;
+                      ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+                      try (InputStream in = connection.getInputStream()) {
+                          byte[] buffer = new byte[16384];
+                          for (int read; (read = in.read(buffer)) != -1; ) {
+                              bytes.write(buffer, 0, read);
+                              if (bytes.size() > 15 * 1024 * 1024) return null;
+                          }
+                      }
+                      byte[] data = bytes.toByteArray();
+                      BitmapFactory.Options options = new BitmapFactory.Options();
+                      options.inJustDecodeBounds = true;
+                      BitmapFactory.decodeByteArray(data, 0, data.length, options);
+                      int sample = 1;
+                      while (options.outWidth / (sample * 2) >= width) sample *= 2;
+                      options.inJustDecodeBounds = false;
+                      options.inSampleSize = sample;
+                      return BitmapFactory.decodeByteArray(data, 0, data.length, options);
+                  } catch (IOException | RuntimeException | OutOfMemoryError failure) {
+                      return null;
+                  } finally {
+                      if (connection != null) connection.disconnect();
+                  }
+              }
+          }
+          JAVA_END
+          cat > patches/src/main/kotlin/app/morphe/patches/pinterest/actions/ShuffleBoardPatch.kt <<'KOTLIN_END'
+          /*
+           * Shuffle board, an unofficial local addition to HushPinterest.
+           * Menu stubs adapted from DownloadBoardPatch.kt, Copyright 2026 HushPinterest contributors.
+           * SPDX-License-Identifier: GPL-3.0-only
+           */
+          package app.morphe.patches.pinterest.actions
+
+          import app.morphe.patcher.extensions.InstructionExtensions.addInstructions
+          import app.morphe.patcher.patch.PatchException
+          import app.morphe.patcher.patch.bytecodePatch
+          import app.morphe.patches.pinterest.ads.feedListHoldersHooked
+          import app.morphe.patches.pinterest.ads.feedListHookPatch
+          import app.morphe.patches.pinterest.misc.extension.EXTENSION_PACKAGE
+          import app.morphe.patches.pinterest.misc.extension.pinterestExtensionPatch
+          import app.morphe.patches.pinterest.misc.extension.requireStub
+          import app.morphe.patches.pinterest.misc.extension.writeStub
+          import app.morphe.patches.pinterest.misc.settings.settingsPatch
+          import app.morphe.patches.pinterest.ui.mutable
+          import app.morphe.patches.shared.compat.AppCompatibilities
+          import com.android.tools.smali.dexlib2.iface.reference.FieldReference
+          import com.android.tools.smali.dexlib2.iface.reference.MethodReference
+
+          private const val SHUFFLE_BOARDS = "$EXTENSION_PACKAGE/actions/ShuffleBoard;"
+          private const val KOTLIN_FUNCTION = "Lkotlin/jvm/functions/Function1;"
+
+          private fun FieldReference.ref() = "$definingClass->$name:$type"
+          private fun MethodReference.ref() = "$definingClass->$name(${parameterTypes.joinToString("")})$returnType"
+
+          @Suppress("unused")
+          val shuffleBoardPatch = bytecodePatch(
+              name = "Shuffle board",
+              description = "Adds Shuffle all pins to a board's menu. It loads the whole board and shows every pin in a random order.",
+          ) {
+              category("Interface")
+              dependsOn(settingsPatch, pinterestExtensionPatch, feedListHookPatch)
+              compatibleWith(*AppCompatibilities.pinterest())
+              execute {
+                  if (feedListHoldersHooked == 0) throw PatchException("Shuffle board: no list holder was hooked")
+                  val board = boardMenu()
+                  listOf("menuItems", "menuHandler", "menuCopy", "menuRow", "titleResource", "boardId", "dismissMenu")
+                      .forEach { requireStub(SHUFFLE_BOARDS, it) }
+
+                  writeStub(SHUFFLE_BOARDS, "menuItems", 2, """
+                      check-cast p0, ${board.group}
+                      iget-object v0, p0, ${board.items.ref()}
+                      return-object v0
+                  """)
+                  writeStub(SHUFFLE_BOARDS, "menuHandler", 2, """
+                      check-cast p0, ${board.group}
+                      iget-object v0, p0, ${board.handler.ref()}
+                      return-object v0
+                  """)
+                  writeStub(SHUFFLE_BOARDS, "menuCopy", 5, """
+                      check-cast p0, ${board.group}
+                      iget-object v0, p0, ${board.label.ref()}
+                      check-cast p2, $KOTLIN_FUNCTION
+                      new-instance v1, ${board.group}
+                      invoke-direct { v1, v0, p1, p2 }, ${board.groupInit.ref()}
+                      return-object v1
+                  """)
+                  val arguments = board.rowInit.parameterTypes.size
+                  val values = (0 until arguments).joinToString("\n") { at ->
+                      when (at) {
+                          board.title -> "move/from16 v${at + 1}, p0"
+                          board.index -> "move/from16 v${at + 1}, p1"
+                          board.text -> "move-object/from16 v${at + 1}, p2"
+                          else -> "const/16 v${at + 1}, 0x0"
+                      }
+                  }
+                  writeStub(SHUFFLE_BOARDS, "menuRow", arguments + 4, """
+                      new-instance v0, ${board.row}
+                      $values
+                      invoke-direct/range { v0 .. v$arguments }, ${board.rowInit.ref()}
+                      return-object v0
+                  """)
+                  writeStub(SHUFFLE_BOARDS, "titleResource", 1, """
+                      sget v0, ${board.titleResource.ref()}
+                      return v0
+                  """)
+                  writeStub(SHUFFLE_BOARDS, "boardId", 2, """
+                      check-cast p0, ${board.presenter}
+                      iget-object v0, p0, ${board.boardId.ref()}
+                      return-object v0
+                  """)
+                  writeStub(SHUFFLE_BOARDS, "dismissMenu", 2, """
+                      check-cast p0, ${board.presenter}
+                      iget-object v0, p0, ${board.events.ref()}
+                      if-eqz v0, :no_events
+                      invoke-static { v0 }, ${board.dismiss.ref()}
+                      :no_events
+                      return-void
+                  """)
+                  mutable(board.method).addInstructions(board.insert, """
+                      invoke-static { v${board.menu}, v${board.self} }, $SHUFFLE_BOARDS->menu(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;
+                      move-result-object v${board.menu}
+                      check-cast v${board.menu}, ${board.group}
+                  """)
+              }
+          }
+          KOTLIN_END
+          F=$EXT/ads/FeedFilter.java
+          sed -i 's/^import app\.hushpinterest\.extension\.pinterest\.actions\.BoardDownloads;/&\nimport app.hushpinterest.extension.pinterest.actions.ShuffleBoard;/' $F
+          sed -i 's/^\( *\)BoardDownloads\.record(\([a-z]*\));/&\n\1ShuffleBoard.record(\2);/' $F
+          test "$(grep -c 'ShuffleBoard.record(' $F)" = 2
+
+      - name: Build
+        shell: bash
+        working-directory: hp
+        env:
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ./gradlew :patches:generatePatchesList
+          ./gradlew :patches:buildAndroid
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shuffle-patches
+          path: hp/patches/build/release/*.mpp
+          if-no-files-found: error
